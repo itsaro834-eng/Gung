@@ -1,0 +1,790 @@
+--[[
+    vault.lua  —  single-file executor
+    requires: Level 7 API (Drawing, getgenv, setfpscap)
+    fallback: ScreenGui renderer if Drawing is nil
+    load:     loadstring(game:HttpGet("https://your.host/vault.lua"))()
+]]
+
+local VERSION = "1.0.0"
+
+--------------------------------------------------------------------------------
+-- config
+--------------------------------------------------------------------------------
+local CFG = {
+    menu = {
+        title = "vault", toggleKey = Enum.KeyCode.RightShift,
+        accent = Color3.fromRGB(140, 92, 255),
+        bg     = Color3.fromRGB(18, 18, 22),
+        panel  = Color3.fromRGB(26, 26, 32),
+        panel2 = Color3.fromRGB(32, 32, 40),
+        text   = Color3.fromRGB(232, 232, 238),
+        sub    = Color3.fromRGB(150, 150, 162),
+        font   = Enum.Font.GothamMedium,
+        fontB  = Enum.Font.GothamBold,
+        width  = 460, height = 340, pad = 10,
+        tabH   = 30,
+    },
+    esp = {
+        enabled = false, boxes = true, names = true, health = true,
+        distance = true, tracers = false, teamCheck = true,
+        maxDist = 700, textSize = 13,
+        accent = Color3.fromRGB(140, 92, 255),
+        team   = Color3.fromRGB(90, 200, 120),
+        enemy  = Color3.fromRGB(230, 90, 90),
+        text   = Color3.fromRGB(240, 240, 245),
+    },
+    aim = {
+        enabled = false, key = Enum.UserInputType.MouseButton2,
+        fov = 120, smooth = 8.0, teamCheck = true, wallCheck = false,
+        part = "Head", prediction = 0.16, showFov = true,
+        fovColor = Color3.fromRGB(140, 92, 255), fovTransparency = 0.7,
+    },
+}
+
+--------------------------------------------------------------------------------
+-- services + helpers
+--------------------------------------------------------------------------------
+local Players       = game:GetService("Players")
+local RunService    = game:GetService("RunService")
+local UserInput     = game:GetService("UserInputService")
+local Workspace     = game:GetService("Workspace")
+local TweenService  = game:GetService("TweenService")
+local CoreGui       = game:GetService("CoreGui")
+local Camera        = Workspace.CurrentCamera
+local LP            = Players.LocalPlayer
+
+local cloneref = cloneref or function(o) return o end
+local setfpscap = setfpscap or function() end
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props or {}) do o[k] = v end
+    if parent then o.Parent = parent end
+    return o
+end
+
+local function drawing(class, props)
+    if not Drawing then return nil end
+    local d = Drawing.new(class)
+    for k, v in pairs(props or {}) do d[k] = v end
+    return d
+end
+
+local function char(plr) return plr and plr.Character end
+local function hrp(plr)
+    local c = char(plr); return c and c:FindFirstChild("HumanoidRootPart")
+end
+local function hum(plr)
+    local c = char(plr); return c and c:FindFirstChildOfClass("Humanoid")
+end
+local function alive(plr)
+    local h = hum(plr); return h ~= nil and h.Health > 0
+end
+local function sameTeam(plr)
+    if not LP or not plr then return true end
+    local a, b = LP.Team, plr.Team
+    if not a or not b then return false end
+    return a == b
+end
+local function w2v(pos)
+    local sp, onScreen = Camera:WorldToViewportPoint(pos)
+    return Vector2.new(sp.X, sp.Y), onScreen, sp.Z
+end
+local function isVisible(part)
+    if not part then return false end
+    local origin = Camera.CFrame.Position
+    local dir = part.Position - origin
+    local ray = Ray.new(origin, dir)
+    local hit = Workspace:FindPartOnRayWithIgnoreList(ray, {char(LP)}, false, true)
+    return hit == nil or hit == part or hit:IsDescendantOf(part.Parent)
+end
+
+local function safe(fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then warn("[vault] " .. tostring(err)) end
+    return ok
+end
+
+local renderer = Drawing and "drawing" or "gui"
+
+--------------------------------------------------------------------------------
+-- esp
+--------------------------------------------------------------------------------
+local ESP = {
+    objects = {},   -- [player] = { ... }
+    target  = {},   -- shared target list for aim (hrp + pos)
+    enabled = CFG.esp.enabled,
+}
+
+local espGui
+local function espMakeGUI()
+    if renderer ~= "gui" then return end
+    espGui = new("ScreenGui", { Name = "VaultESP", ResetOnSpawn = false,
+                                IgnoreGuiInset = true, ZIndexBehavior = Enum.ZIndexBehavior.Sibling },
+                (pcall(function() return CoreGui end) and CoreGui) or LP:WaitForChild("PlayerGui"))
+end
+espMakeGUI()
+
+local function espDraw(p)
+    local s = {}
+    if renderer == "drawing" then
+        s.box    = drawing("Square", { Visible = false, Thickness = 1, Filled = false })
+        s.name   = drawing("Text",   { Visible = false, Size = CFG.esp.textSize, Center = true, Outline = true, Font = 2 })
+        s.dist   = drawing("Text",   { Visible = false, Size = CFG.esp.textSize - 2, Center = true, Outline = true, Font = 2 })
+        s.hBg    = drawing("Square", { Visible = false, Thickness = 1, Filled = true, Color = Color3.fromRGB(30,30,34) })
+        s.hFg    = drawing("Square", { Visible = false, Thickness = 1, Filled = true })
+        s.tracer = drawing("Line",   { Visible = false, Thickness = 1, Transparency = 0.35 })
+    else
+        s.box    = new("Frame", { BackgroundTransparency = 1, BorderSizePixel = 1,
+                                  BorderColor3 = CFG.esp.accent, Visible = false }, espGui)
+        s.name   = new("TextLabel", { BackgroundTransparency = 1, TextColor3 = CFG.esp.text,
+                                      TextSize = CFG.esp.textSize, Font = CFG.menu.font,
+                                      TextStrokeTransparency = 0.4, Visible = false }, espGui)
+        s.dist   = new("TextLabel", { BackgroundTransparency = 1, TextColor3 = CFG.esp.text,
+                                      TextSize = CFG.esp.textSize - 2, Font = CFG.menu.font,
+                                      TextStrokeTransparency = 0.4, Visible = false }, espGui)
+        s.hBg    = new("Frame", { BackgroundColor3 = Color3.fromRGB(30,30,34),
+                                  BorderSizePixel = 0, Visible = false }, espGui)
+        s.hFg    = new("Frame", { BackgroundColor3 = CFG.esp.team,
+                                  BorderSizePixel = 0, Visible = false }, espGui)
+        s.tracer = new("Frame", { BackgroundColor3 = CFG.esp.accent,
+                                  BorderSizePixel = 0, Visible = false }, espGui)
+    end
+    return s
+end
+
+local function espRemove(p)
+    local s = ESP.objects[p]
+    if not s then return end
+    for _, o in pairs(s) do
+        if o and o.Remove then o:Remove() elseif o and o.Destroy then o:Destroy() end
+    end
+    ESP.objects[p] = nil
+end
+
+local function espColor(p)
+    if CFG.esp.teamCheck and sameTeam(p) then return CFG.esp.team end
+    return CFG.esp.enemy
+end
+
+local function espUpdate(p)
+    if not alive(p) or p == LP then
+        local s = ESP.objects[p]
+        if s then
+            for _, o in pairs(s) do
+                if o.Visible ~= nil then o.Visible = false end
+            end
+        end
+        return
+    end
+    local root = hrp(p); local h = hum(p)
+    if not root or not h then return end
+
+    local myRoot = hrp(LP)
+    if not myRoot then return end
+    local dist = (root.Position - myRoot.Position).Magnitude
+    if dist > CFG.esp.maxDist then
+        local s = ESP.objects[p]
+        if s then for _, o in pairs(s) do if o.Visible ~= nil then o.Visible = false end end end
+        return
+    end
+
+    local s = ESP.objects[p]
+    if not s then s = espDraw(p); ESP.objects[p] = s end
+
+    local headPos = root.Position + Vector3.new(0, root.Size.Y / 2 + 0.5, 0)
+    local feetPos = root.Position - Vector3.new(0, root.Size.Y / 2, 0)
+    local top2, onTop, topZ = w2v(headPos)
+    local bot2, onBot, botZ = w2v(feetPos)
+    local drawable = onTop and onBot and topZ > 0 and botZ > 0
+
+    if not drawable then
+        for _, o in pairs(s) do if o.Visible ~= nil then o.Visible = false end end
+        return
+    end
+
+    local boxH = bot2.Y - top2.Y
+    local boxW = boxH * 0.55
+    local boxX = top2.X - boxW / 2
+    local boxY = top2.Y
+
+    local col = espColor(p)
+
+    if CFG.esp.boxes then
+        if renderer == "drawing" then
+            s.box.Position = Vector2.new(boxX, boxY)
+            s.box.Size     = Vector2.new(boxW, boxH)
+            s.box.Color    = col
+            s.box.Visible  = true
+        else
+            s.box.Position = UDim2.fromOffset(boxX, boxY)
+            s.box.Size     = UDim2.fromOffset(boxW, boxH)
+            s.box.BorderColor3 = col
+            s.box.Visible  = true
+        end
+    else
+        s.box.Visible = false
+    end
+
+    if CFG.esp.names then
+        local txt = p.Name
+        if renderer == "drawing" then
+            s.name.Text = txt
+            s.name.Position = Vector2.new(top2.X, top2.Y - CFG.esp.textSize - 4)
+            s.name.Color = CFG.esp.text
+            s.name.Visible = true
+        else
+            s.name.Text = txt
+            s.name.Position = UDim2.fromOffset(top2.X - 100, top2.Y - CFG.esp.textSize - 4)
+            s.name.Size = UDim2.fromOffset(200, CFG.esp.textSize + 2)
+            s.name.TextXAlignment = Enum.TextXAlignment.Center
+            s.name.Visible = true
+        end
+    else
+        s.name.Visible = false
+    end
+
+    if CFG.esp.distance then
+        local dtxt = tostring(math.floor(dist)) .. "m"
+        if renderer == "drawing" then
+            s.dist.Text = dtxt
+            s.dist.Position = Vector2.new(top2.X, bot2.Y + 2)
+            s.dist.Color = CFG.esp.text
+            s.dist.Visible = true
+        else
+            s.dist.Text = dtxt
+            s.dist.Position = UDim2.fromOffset(top2.X - 60, bot2.Y + 2)
+            s.dist.Size = UDim2.fromOffset(120, CFG.esp.textSize)
+            s.dist.TextXAlignment = Enum.TextXAlignment.Center
+            s.dist.Visible = true
+        end
+    else
+        s.dist.Visible = false
+    end
+
+    if CFG.esp.health then
+        local pct = math.clamp(h.Health / h.MaxHealth, 0, 1)
+        local hW, hH = 3, boxH
+        local hX = boxX - 6
+        if renderer == "drawing" then
+            s.hBg.Position = Vector2.new(hX, boxY)
+            s.hBg.Size     = Vector2.new(hW, hH)
+            s.hBg.Visible  = true
+            s.hFg.Position = Vector2.new(hX, boxY + hH * (1 - pct))
+            s.hFg.Size     = Vector2.new(hW, hH * pct)
+            s.hFg.Color    = Color3.fromRGB(90, 220, 110):Lerp(Color3.fromRGB(230, 60, 60), 1 - pct)
+            s.hFg.Visible  = true
+        else
+            s.hBg.Position = UDim2.fromOffset(hX, boxY)
+            s.hBg.Size     = UDim2.fromOffset(hW, hH)
+            s.hBg.Visible  = true
+            s.hFg.Position = UDim2.fromOffset(hX, boxY + hH * (1 - pct))
+            s.hFg.Size     = UDim2.fromOffset(hW, hH * pct)
+            s.hFg.BackgroundColor3 = Color3.fromRGB(90, 220, 110):Lerp(Color3.fromRGB(230, 60, 60), 1 - pct)
+            s.hFg.Visible  = true
+        end
+    else
+        s.hBg.Visible = false
+        s.hFg.Visible = false
+    end
+
+    if CFG.esp.tracers then
+        local vp = Camera.ViewportSize
+        local bottom = Vector2.new(vp.X / 2, vp.Y)
+        if renderer == "drawing" then
+            s.tracer.From = bottom
+            s.tracer.To   = Vector2.new(top2.X, bot2.Y)
+            s.tracer.Color = col
+            s.tracer.Visible = true
+        else
+            local from, to = bottom, Vector2.new(top2.X, bot2.Y)
+            local d = to - from
+            local len = d.Magnitude
+            local ang = math.deg(math.atan2(d.Y, d.X))
+            s.tracer.Position = UDim2.fromOffset((from.X + to.X) / 2 - len / 2, (from.Y + to.Y) / 2 - 1)
+            s.tracer.Size     = UDim2.fromOffset(len, 1)
+            s.tracer.Rotation = ang
+            s.tracer.BackgroundColor3 = col
+            s.tracer.Visible  = true
+        end
+    else
+        s.tracer.Visible = false
+    end
+
+    -- publish to aim target list
+    ESP.target[p] = { hrp = root, pos = root.Position, head = headPos, screen = top2, onScreen = drawable }
+end
+
+local function espLoop()
+    for p in pairs(ESP.objects) do
+        if not p.Parent or p == LP then espRemove(p) end
+    end
+    ESP.target = {}
+    if ESP.enabled then
+        for _, p in ipairs(Players:GetPlayers()) do
+            if p ~= LP then safe(espUpdate, p) end
+        end
+    else
+        for _, s in pairs(ESP.objects) do
+            for _, o in pairs(s) do if o.Visible ~= nil then o.Visible = false end end
+        end
+    end
+end
+
+RunService.RenderStepped:Connect(function()
+    safe(espLoop)
+end)
+
+Players.PlayerRemoving:Connect(espRemove)
+
+--------------------------------------------------------------------------------
+-- aimbot
+--------------------------------------------------------------------------------
+local AIM = { enabled = CFG.aim.enabled, holding = false, fovCircle = nil }
+
+if CFG.aim.showFov then
+    if renderer == "drawing" then
+        AIM.fovCircle = drawing("Circle", {
+            Visible = CFG.aim.showFov, Thickness = 1,
+            Color = CFG.aim.fovColor, Transparency = CFG.aim.fovTransparency,
+            Filled = false, NumSides = 60,
+        })
+    else
+        AIM.fovCircle = new("Frame", {
+            BackgroundTransparency = 1, BorderSizePixel = 1,
+            BorderColor3 = CFG.aim.fovColor, Visible = CFG.aim.showFov,
+            Size = UDim2.fromOffset(CFG.aim.fov * 2, CFG.aim.fov * 2),
+            AnchorPoint = Vector2.new(0.5, 0.5), Parent = espGui,
+        })
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, AIM.fovCircle)
+    end
+end
+
+local function bestTarget()
+    local best, bestScore = nil, math.huge
+    local vp = Camera.ViewportSize
+    local center = Vector2.new(vp.X / 2, vp.Y / 2)
+    local myRoot = hrp(LP)
+    if not myRoot then return nil end
+    for p, t in pairs(ESP.target) do
+        if not t.onScreen then goto continue end
+        if p == LP then goto continue end
+        if CFG.aim.teamCheck and sameTeam(p) then goto continue end
+        if not alive(p) then goto continue end
+        if CFG.aim.wallCheck then
+            local part = char(p) and char(p):FindFirstChild(CFG.aim.part)
+            if not isVisible(part) then goto continue end
+        end
+        local screenPos = t.screen
+        local d2 = (screenPos - center).Magnitude
+        if d2 > CFG.aim.fov then goto continue end
+        local worldDist = (t.pos - myRoot.Position).Magnitude
+        local score = d2 + worldDist * 0.05
+        if score < bestScore then
+            bestScore = score
+            best = p
+        end
+        ::continue::
+    end
+    return best
+end
+
+local function aimStep(dt)
+    if AIM.holding then
+        local target = bestTarget()
+        if target then
+            local c = char(target)
+            local part = c and c:FindFirstChild(CFG.aim.part)
+            if not part then return end
+            local vel = part.AssemblyLinearVelocity or Vector3.zero
+            local predict = vel * CFG.aim.prediction
+            local pos = part.Position + predict
+            local current = Camera.CFrame
+            local look = CFrame.new(current.Position, pos)
+            local alpha = math.clamp(dt * CFG.aim.smooth, 0, 1)
+            Camera.CFrame = current:Lerp(look, alpha)
+        end
+    end
+    if AIM.fovCircle and renderer == "drawing" then
+        AIM.fovCircle.Position = Vector2.new(Camera.ViewportSize.X / 2, Camera.ViewportSize.Y / 2)
+        AIM.fovCircle.Radius = CFG.aim.fov
+        AIM.fovCircle.Visible = CFG.aim.showFov and CFG.aim.enabled
+    elseif AIM.fovCircle and renderer == "gui" then
+        AIM.fovCircle.Visible = CFG.aim.showFov and CFG.aim.enabled
+        AIM.fovCircle.Size = UDim2.fromOffset(CFG.aim.fov * 2, CFG.aim.fov * 2)
+        AIM.fovCircle.BorderColor3 = CFG.aim.fovColor
+    end
+end
+
+RunService.RenderStepped:Connect(function(dt)
+    safe(aimStep, dt)
+end)
+
+UserInput.InputBegan:Connect(function(input, gp)
+    if gp then return end
+    if input.UserInputType == CFG.aim.key then
+        AIM.holding = true
+    end
+end)
+UserInput.InputEnded:Connect(function(input, gp)
+    if input.UserInputType == CFG.aim.key then
+        AIM.holding = false
+    end
+end)
+
+--------------------------------------------------------------------------------
+-- menu
+--------------------------------------------------------------------------------
+local Menu = {
+    visible = true,
+    tabs    = {},
+    active  = "esp",
+    gui     = nil,
+    main    = nil,
+    dragging = false,
+}
+
+local function buildMenu()
+    Menu.gui = new("ScreenGui", {
+        Name = "VaultMenu", ResetOnSpawn = false, IgnoreGuiInset = true,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    }, (pcall(function() return CoreGui end) and CoreGui) or LP:WaitForChild("PlayerGui"))
+
+    Menu.main = new("Frame", {
+        Name = "Main",
+        Size = UDim2.fromOffset(CFG.menu.width, CFG.menu.height),
+        Position = UDim2.new(0.5, -CFG.menu.width / 2, 0.5, -CFG.menu.height / 2),
+        BackgroundColor3 = CFG.menu.bg,
+        BorderSizePixel = 0,
+        Active = true,
+    }, Menu.gui)
+    new("UICorner", { CornerRadius = UDim.new(0, 8) }, Menu.main)
+    new("UIStroke", { Color = CFG.menu.accent, Transparency = 0.6, Thickness = 1 }, Menu.main)
+
+    -- title bar
+    local title = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40), BackgroundColor3 = CFG.menu.panel,
+        BorderSizePixel = 0,
+    }, Menu.main)
+    new("UICorner", { CornerRadius = UDim.new(0, 8) }, title)
+    new("Frame", { Size = UDim2.new(1, 0, 0, 10), Position = UDim2.new(0, 0, 1, -10),
+                   BackgroundColor3 = CFG.menu.panel, BorderSizePixel = 0 }, title)
+
+    new("TextLabel", {
+        Text = CFG.menu.title .. "  " .. VERSION,
+        Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, -100, 1, 0),
+        BackgroundTransparency = 1, TextColor3 = CFG.menu.text,
+        TextXAlignment = Enum.TextXAlignment.Left, Font = CFG.menu.fontB,
+        TextSize = 15,
+    }, title)
+
+    local close = new("TextButton", {
+        Text = "×", Size = UDim2.fromOffset(28, 28), Position = UDim2.new(1, -36, 0, 6),
+        BackgroundColor3 = CFG.menu.panel2, TextColor3 = CFG.menu.text,
+        Font = CFG.menu.fontB, TextSize = 16, AutoButtonColor = true,
+    }, title)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, close)
+    close.MouseButton1Click:Connect(function() Menu.visible = false; Menu.main.Visible = false end)
+
+    -- drag
+    title.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            Menu.dragging = true
+            local start = input.Position
+            local origin = Menu.main.Position
+            local moveConn, endConn
+            moveConn = UserInput.InputChanged:Connect(function(m)
+                if m.UserInputType == Enum.UserInputType.MouseMovement then
+                    local delta = m.Position - start
+                    Menu.main.Position = UDim2.new(origin.X.Scale, origin.X.Offset + delta.X,
+                                                   origin.Y.Scale, origin.Y.Offset + delta.Y)
+                end
+            end)
+            endConn = UserInput.InputEnded:Connect(function(e)
+                if e.UserInputType == Enum.UserInputType.MouseButton1 then
+                    Menu.dragging = false
+                    moveConn:Disconnect()
+                    endConn:Disconnect()
+                end
+            end)
+        end
+    end)
+
+    -- tabs
+    local tabBar = new("Frame", {
+        Size = UDim2.new(1, -20, 0, CFG.menu.tabH),
+        Position = UDim2.fromOffset(10, 46),
+        BackgroundColor3 = CFG.menu.panel,
+        BorderSizePixel = 0,
+    }, Menu.main)
+    new("UICorner", { CornerRadius = UDim.new(0, 6) }, tabBar)
+    new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        Padding = UDim.new(0, 4),
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, tabBar)
+    new("UIPadding", { PaddingLeft = UDim.new(0, 6) }, tabBar)
+
+    local content = new("Frame", {
+        Size = UDim2.new(1, -20, 1, -20 - CFG.menu.tabH - 46),
+        Position = UDim2.fromOffset(10, 46 + CFG.menu.tabH + 6),
+        BackgroundTransparency = 1,
+    }, Menu.main)
+    Menu.content = content
+
+    local function makeTab(name, order)
+        local btn = new("TextButton", {
+            Text = name, Size = UDim2.fromOffset(84, CFG.menu.tabH - 8),
+            BackgroundColor3 = CFG.menu.panel2, TextColor3 = CFG.menu.sub,
+            Font = CFG.menu.font, TextSize = 12, LayoutOrder = order,
+            AutoButtonColor = false,
+        }, tabBar)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, btn)
+        Menu.tabs[name] = { button = btn, frame = nil }
+        btn.MouseButton1Click:Connect(function() Menu.setTab(name) end)
+    end
+
+    function Menu.setTab(name)
+        Menu.active = name
+        for n, t in pairs(Menu.tabs) do
+            if n == name then
+                t.button.BackgroundColor3 = CFG.menu.accent
+                t.button.TextColor3 = CFG.menu.text
+                if not t.frame then
+                    t.frame = new("Frame", {
+                        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+                        Visible = true,
+                    }, Menu.content)
+                    new("UIListLayout", {
+                        Padding = UDim.new(0, 6),
+                        SortOrder = Enum.SortOrder.LayoutOrder,
+                    }, t.frame)
+                    Menu.builders[name](t.frame)
+                end
+                t.frame.Visible = true
+            else
+                t.button.BackgroundColor3 = CFG.menu.panel2
+                t.button.TextColor3 = CFG.menu.sub
+                if t.frame then t.frame.Visible = false end
+            end
+        end
+    end
+
+    makeTab("esp", 1)
+    makeTab("aim", 2)
+    makeTab("misc", 3)
+
+    -- builders
+    local builders = {}
+
+    local function makeToggle(parent, label, get, set, order)
+        local row = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = CFG.menu.panel,
+            BorderSizePixel = 0, LayoutOrder = order,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, row)
+        new("TextLabel", {
+            Text = label, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -70, 1, 0),
+            TextColor3 = CFG.menu.text, Font = CFG.menu.font, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local track = new("Frame", {
+            Size = UDim2.fromOffset(38, 20), Position = UDim2.new(1, -50, 0.5, -10),
+            BackgroundColor3 = CFG.menu.panel2, BorderSizePixel = 0,
+        }, row)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+        local knob = new("Frame", {
+            Size = UDim2.fromOffset(16, 16), Position = UDim2.fromOffset(2, 2),
+            BackgroundColor3 = CFG.menu.sub, BorderSizePixel = 0,
+        }, track)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+
+        local function paint(v)
+            local target = v and CFG.menu.accent or CFG.menu.panel2
+            local knobTarget = v and CFG.menu.text or CFG.menu.sub
+            local pos = v and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2)
+            TweenService:Create(track, TweenInfo.new(0.15), { BackgroundColor3 = target }):Play()
+            TweenService:Create(knob, TweenInfo.new(0.15), { Position = pos, BackgroundColor3 = knobTarget }):Play()
+        end
+        paint(get())
+
+        local click = new("TextButton", {
+            Text = "", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        }, row)
+        click.MouseButton1Click:Connect(function()
+            local v = not get()
+            set(v)
+            paint(v)
+        end)
+    end
+
+    local function makeSlider(parent, label, min, max, get, set, order)
+        local row = new("Frame", {
+            Size = UDim2.new(1, 0, 0, 42), BackgroundColor3 = CFG.menu.panel,
+            BorderSizePixel = 0, LayoutOrder = order,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, row)
+        new("TextLabel", {
+            Text = label, BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(12, 4), Size = UDim2.new(1, -60, 0, 16),
+            TextColor3 = CFG.menu.text, Font = CFG.menu.font, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        local valueLabel = new("TextLabel", {
+            Text = tostring(get()), BackgroundTransparency = 1,
+            Position = UDim2.new(1, -60, 0, 4), Size = UDim2.fromOffset(48, 16),
+            TextColor3 = CFG.menu.accent, Font = CFG.menu.fontB, TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Right,
+        }, row)
+        local barBg = new("Frame", {
+            Size = UDim2.new(1, -24, 0, 6), Position = UDim2.fromOffset(12, 26),
+            BackgroundColor3 = CFG.menu.panel2, BorderSizePixel = 0,
+        }, row)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, barBg)
+        local fill = new("Frame", {
+            Size = UDim2.new((get() - min) / (max - min), 0, 1, 0),
+            BackgroundColor3 = CFG.menu.accent, BorderSizePixel = 0,
+        }, barBg)
+        new("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+        local hit = new("TextButton", {
+            Text = "", Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1,
+        }, row)
+
+        local function applyFromX(x)
+            local rel = math.clamp((x - barBg.AbsolutePosition.X) / barBg.AbsoluteSize.X, 0, 1)
+            local v = min + (max - min) * rel
+            v = math.floor(v * 100 + 0.5) / 100
+            set(v)
+            valueLabel.Text = tostring(v)
+            fill.Size = UDim2.new(rel, 0, 1, 0)
+        end
+
+        local dragging = false
+        hit.InputBegan:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging = true; applyFromX(i.Position.X)
+            end
+        end)
+        hit.InputEnded:Connect(function(i)
+            if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
+        end)
+        UserInput.InputChanged:Connect(function(i)
+            if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then
+                applyFromX(i.Position.X)
+            end
+        end)
+    end
+
+    builders.esp = function(parent)
+        makeToggle(parent, "enabled", function() return ESP.enabled end,
+            function(v) ESP.enabled = v; CFG.esp.enabled = v end, 1)
+        makeToggle(parent, "boxes", function() return CFG.esp.boxes end,
+            function(v) CFG.esp.boxes = v end, 2)
+        makeToggle(parent, "names", function() return CFG.esp.names end,
+            function(v) CFG.esp.names = v end, 3)
+        makeToggle(parent, "health bars", function() return CFG.esp.health end,
+            function(v) CFG.esp.health = v end, 4)
+        makeToggle(parent, "distance", function() return CFG.esp.distance end,
+            function(v) CFG.esp.distance = v end, 5)
+        makeToggle(parent, "tracers", function() return CFG.esp.tracers end,
+            function(v) CFG.esp.tracers = v end, 6)
+        makeToggle(parent, "team check", function() return CFG.esp.teamCheck end,
+            function(v) CFG.esp.teamCheck = v end, 7)
+        makeSlider(parent, "max distance", 50, 2000,
+            function() return CFG.esp.maxDist end,
+            function(v) CFG.esp.maxDist = v end, 8)
+    end
+
+    builders.aim = function(parent)
+        makeToggle(parent, "enabled", function() return AIM.enabled end,
+            function(v) AIM.enabled = v; CFG.aim.enabled = v end, 1)
+        makeToggle(parent, "team check", function() return CFG.aim.teamCheck end,
+            function(v) CFG.aim.teamCheck = v end, 2)
+        makeToggle(parent, "wall check", function() return CFG.aim.wallCheck end,
+            function(v) CFG.aim.wallCheck = v end, 3)
+        makeToggle(parent, "show fov", function() return CFG.aim.showFov end,
+            function(v) CFG.aim.showFov = v end, 4)
+        makeSlider(parent, "fov", 10, 800,
+            function() return CFG.aim.fov end,
+            function(v) CFG.aim.fov = v end, 5)
+        makeSlider(parent, "smooth", 1, 30,
+            function() return CFG.aim.smooth end,
+            function(v) CFG.aim.smooth = v end, 6)
+        makeSlider(parent, "prediction", 0, 1,
+            function() return CFG.aim.prediction end,
+            function(v) CFG.aim.prediction = v end, 7)
+    end
+
+    builders.misc = function(parent)
+        local info = new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = CFG.menu.panel,
+            BorderSizePixel = 0, TextColor3 = CFG.menu.sub, Font = CFG.menu.font,
+            TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "  renderer: " .. renderer .. "   |   version: " .. VERSION,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, info)
+        local fpsRow = new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = CFG.menu.panel,
+            BorderSizePixel = 0, TextColor3 = CFG.menu.sub, Font = CFG.menu.font,
+            TextSize = 12, TextXAlignment = Enum.TextXAlignment.Left,
+            Text = "  fps: —", LayoutOrder = 2,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, fpsRow)
+        RunService.RenderStepped:Connect(function()
+            safe(function()
+                fpsRow.Text = "  fps: " .. tostring(math.floor(1 / RunService.RenderStepped:Wait() or 60))
+            end)
+        end)
+
+        local unload = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = CFG.menu.panel,
+            BorderSizePixel = 0, TextColor3 = CFG.menu.enemy,
+            Font = CFG.menu.fontB, TextSize = 13, Text = "unload",
+            LayoutOrder = 3,
+        }, parent)
+        new("UICorner", { CornerRadius = UDim.new(0, 5) }, unload)
+        unload.MouseButton1Click:Connect(function()
+            safe(function()
+                ESP.enabled = false
+                AIM.enabled = false
+                for p in pairs(ESP.objects) do espRemove(p) end
+                if Menu.gui then Menu.gui:Destroy() end
+                if espGui then espGui:Destroy() end
+                if getgenv().Vault then getgenv().Vault = nil end
+            end)
+        end)
+    end
+
+    Menu.builders = builders
+
+    -- toggle
+    UserInput.InputBegan:Connect(function(input, gp)
+        if gp then return end
+        if input.KeyCode == CFG.menu.toggleKey then
+            Menu.visible = not Menu.visible
+            Menu.main.Visible = Menu.visible
+        end
+    end)
+
+    Menu.setTab("esp")
+end
+
+safe(buildMenu)
+
+getgenv().Vault = {
+    version = VERSION,
+    esp     = ESP,
+    aim     = AIM,
+    menu    = Menu,
+    config  = CFG,
+    unload  = function()
+        for p in pairs(ESP.objects) do espRemove(p) end
+        if Menu.gui then Menu.gui:Destroy() end
+        if espGui then espGui:Destroy() end
+        getgenv().Vault = nil
+    end,
+}
+
+print(("[vault] loaded v%s  renderer=%s  executor-level=7"):format(VERSION, renderer))
